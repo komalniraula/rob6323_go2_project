@@ -78,6 +78,12 @@ class Rob6323Go2Env(DirectRLEnv):
         self.Kd = torch.tensor([cfg.Kd] * 12, device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
         self.motor_offsets = torch.zeros(self.num_envs, 12, device=self.device)
         self.torque_limits = cfg.torque_limits
+
+        # --- Actuator friction parameters (Bonus Task 1) ---
+        # Per-environment (shared across joints in one env)
+        self.mu_v = torch.zeros(self.num_envs, 1, device=self.device)   # viscous coefficient
+        self.F_s = torch.zeros(self.num_envs, 1, device=self.device)    # stiction coefficient
+
         
         # Get specific body indices
         self._feet_ids = []
@@ -333,6 +339,11 @@ class Rob6323Go2Env(DirectRLEnv):
 
             self._contact_ids_initialized = True
 
+        # --- Actuator friction randomization (Bonus Task 1) ---
+        # Randomize per-episode, per-environment
+        self.mu_v[env_ids] = torch.rand(len(env_ids), 1, device=self.device) * 0.3
+        self.F_s[env_ids] = torch.rand(len(env_ids), 1, device=self.device) * 2.5
+
     
 
     def _set_debug_vis_impl(self, debug_vis: bool):
@@ -396,21 +407,31 @@ class Rob6323Go2Env(DirectRLEnv):
 
     def _apply_action(self) -> None:
         # Compute PD torques
-        torques = torch.clip(
-            (
-                self.Kp * (
-                    self.desired_joint_pos 
-                    - self.robot.data.joint_pos 
-                )
-                - self.Kd * self.robot.data.joint_vel
-            ),
-            -self.torque_limits,
-            self.torque_limits,
+        tau_pd = (
+            self.Kp * (self.desired_joint_pos - self.robot.data.joint_pos)
+            - self.Kd * self.robot.data.joint_vel
         )
 
+        # --- Actuator friction model (Bonus Task 1) ---
+        qdot = self.robot.data.joint_vel  # (num_envs, 12)
+
+        # Stiction + viscous friction
+        tau_stiction = self.F_s * torch.tanh(qdot / 0.1)
+        tau_viscous = self.mu_v * qdot
+        tau_friction = tau_stiction + tau_viscous
+
+        # Subtract friction from PD torque
+        torques = tau_pd - tau_friction
+
+        # Torque limits
+        torques = torch.clip(torques, -self.torque_limits, self.torque_limits)
+
+        # Save for logging / reward
         self._torques = torques
+
         # Apply torques to the robot
         self.robot.set_joint_effort_target(torques)
+
         
     # Defines contact plan
     def _step_contact_targets(self):
